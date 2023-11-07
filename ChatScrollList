@@ -1,0 +1,488 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using DG.Tweening;
+using PVSDK;
+using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.UI;
+using UnityEngine.XR.Interaction.Toolkit;
+using UnityEngine.XR.Interaction.Toolkit.UI;
+using UnityEngine.XR;
+
+public class ChatScrollList:MonoBehaviour, IEndDragHandler, IBeginDragHandler, IPointerEnterHandler, IPointerExitHandler
+{
+    public GameObject itemTemplate;
+    public int itemTemplateNum;//设置为item处于最小高度情况下的满屏数量+2
+    public ChatControl chatControl;
+    
+    private ScrollRect _scrollRect;
+    private RectTransform _content;
+    private VerticalLayoutGroup _contentLayout;
+    
+    
+    private float _itemHeight = 0f;
+    private bool _isDragging = false;//是否正在拖拽中
+    private bool _isHover;//是否正在hover中
+    private XRNode _hoverHand;//当前hover的左右手其一，必须与_isHover变量同时更新
+    private int _dataShowBeginIndex = 0;//表示_itemList中的第一个item在整个数据列表中的索引
+    private float _lastVerticalNormalizePosition = 0f;
+    private List<RectTransform> _itemList = new List<RectTransform>();
+    
+    private List<float> _heightDataList = new List<float>();//使用数据序号索引
+    private List<float> _itemPosYList = new List<float>();//使用数据序号索引
+
+    private Action<RectTransform, int> _setItemDataAction;
+    private WaitForEndOfFrame _endOfFrame;
+
+    public void Awake()
+    {
+        //初始化私有变量
+        _scrollRect = GetComponent<ScrollRect>();
+        _content = _scrollRect.content;
+        _contentLayout = _content.GetComponent<VerticalLayoutGroup>();
+        _content.pivot = Vector2.zero;
+        _content.sizeDelta = new Vector2(_content.sizeDelta.x,
+            _contentLayout.padding.top + _contentLayout.padding.bottom);
+        _itemHeight = _contentLayout.padding.top + _contentLayout.padding.bottom;
+        _endOfFrame = new WaitForEndOfFrame();
+
+        //注册回调
+        _scrollRect.onValueChanged.AddListener(OnScroll);
+        LiveDetailMessenger.AddListener(LiveDetailEvent.DanmakuClearAllItems, ClearAllItems);
+
+        //设置ui初始化状态
+        itemTemplate.SetActive(false);
+        var trans = itemTemplate.GetComponent<RectTransform>();
+        trans.anchorMax = Vector2.up;
+        trans.anchorMin = Vector2.up;
+        trans.pivot = new Vector2(0.5f, 0f);
+        _contentLayout.enabled = false;
+    }
+
+    public void Update()
+    {
+        //检测摇杆，判断是否需要上下滑动
+        if (_isHover && IsFullScreen())
+        {
+            InputDevices.GetDeviceAtXRNode(_hoverHand).TryGetFeatureValue(CommonUsages.primary2DAxis, out var input);
+            if (input.y > 0.01f)
+            {
+                ScrollOneLineScreen(true);
+            }
+            else if (input.y < -0.01f)
+            {                    
+                ScrollOneLineScreen(false);
+            }
+        }
+    }
+
+    public void OnDestroy()
+    {
+        LiveDetailMessenger.RemoveListener(LiveDetailEvent.DanmakuClearAllItems, ClearAllItems);
+    }
+
+    public void AddItem(float height)
+    {
+        _heightDataList.Add(height);
+        
+        if (_itemList.Count < itemTemplateNum)
+        {
+            var obj = Instantiate(itemTemplate, _content);
+            obj.transform.SetSiblingIndex(_content.childCount - 1);
+            obj.SetActive(true);
+            obj.name = _itemList.Count.ToString();
+            _itemList.Add(obj.GetComponent<RectTransform>());
+            SetItemData(obj.GetComponent<RectTransform>(),  chatControl.dataListOnShow.Count - 1);
+        }
+
+        // 提前记录是否在底部
+        bool isInBottom = IsInBottom();
+        
+        //设置content大小位置
+        var heightOffset = height + (_heightDataList.Count == 0 ? 0f : _contentLayout.spacing);
+        AdjustContentSize(heightOffset);
+        
+        //设置item位置
+        _itemPosYList.Add(_itemPosYList.Count == 0
+            ? -_contentLayout.padding.top - height
+            : _itemPosYList.Last() - _contentLayout.spacing - height);
+        ResetAllItemPos();
+        
+        // 判断是否下滚
+        if (!_isDragging && isInBottom && IsFullScreen())
+        {
+            ScrollToBottom();
+        }
+        
+        if(!isInBottom && IsFullScreen())
+        {
+            //显示新消息提示
+            ShowNewMessageTip();
+        }
+    }
+
+    /// <summary>
+    /// 外部调用，给一个action，该action用于设置item内部的数据
+    /// </summary>
+    /// <param name="action"></param>
+    public void SetItemDataAction(Action<RectTransform, int> action)
+    {
+        _setItemDataAction = action;
+    }
+
+    /// <summary>
+    /// 外部调用，用于重新设置某个item的数据
+    /// </summary>
+    /// <param name="index">已经加到scrollview中的(onShow)数据索引</param>
+    public void RefreshItemData(int index)
+    {
+        bool isInBottom = IsInBottom();
+        var heightOffset = chatControl.heightListOnShow[index] - _heightDataList[index];
+        AdjustContentSize(heightOffset);
+
+        _heightDataList[index] = chatControl.heightListOnShow[index];
+        ReComputeAllItemPosY();
+        if (_dataShowBeginIndex <= index && index < _dataShowBeginIndex + _itemList.Count)
+        {//刷新的item正在显示
+            ResetAllItemPos();
+            SetItemData(_itemList[index - _dataShowBeginIndex], index);
+            if (!_isDragging && isInBottom && IsFullScreen())
+            {
+                ScrollToBottom();
+            }
+        }
+    }
+
+    /// <summary>
+    /// 当前所有数据是否可以充满viewport
+    /// </summary>
+    /// <returns></returns>
+    public bool IsFullScreen()
+    {
+        if (_scrollRect == null)
+        {
+            return false;
+        }
+        return _itemHeight > _scrollRect.viewport.rect.height;
+    }
+
+    /// <summary>
+    /// 当前是否滑动在底部
+    /// </summary>
+    /// <returns></returns>
+    public bool IsInBottom()
+    {
+        if (_heightDataList.Count == 0 || _scrollRect == null)
+        {
+            return false;
+        }
+        bool isBottom = - _content.anchoredPosition.y - _scrollRect.viewport.rect.height <
+                        _contentLayout.padding.bottom + _heightDataList.Last();
+        return isBottom;
+    }
+
+    /// <summary>
+    /// 刷新走一遍onScroll
+    /// </summary>
+    public void RefreshOnScroll()
+    {
+        OnScroll(_scrollRect.normalizedPosition);
+    }
+    
+    /// <summary>
+    /// ScrollView滑动回调，用于在滑动中自动复用刷新item
+    /// </summary>
+    /// <param name="v">当前的ScrollRect.normalizePosition值</param>
+    private void OnScroll(Vector2 v)
+    {
+        if (_itemList.Count <= 0)
+        {
+            return;
+        }
+
+        // 向上滑_lastVerticalNormalizePosition > v.y
+        while (_content.anchoredPosition.y + _itemHeight >=
+               _contentLayout.padding.top + _contentLayout.spacing * (_dataShowBeginIndex + 1) +
+               GetItemSequenceHeight(0, _dataShowBeginIndex + 1) &&
+               _dataShowBeginIndex + _itemList.Count - 1 != _heightDataList.Count - 1)
+        {
+            //将数据列表中的第一个元素移动到最后一个
+            var item = _itemList[0];
+            _itemList.Remove(item);
+            _itemList.Add(item);
+            
+            _dataShowBeginIndex++;
+
+            int lastDataIndex = _dataShowBeginIndex + _itemList.Count - 1;
+
+            //设置位置
+            SetItemPos(item, lastDataIndex);
+            //设置显示
+            SetItemData(item, lastDataIndex);
+
+        }
+
+        //向下滑_lastVerticalNormalizePosition < v.y
+        while (_content.anchoredPosition.y + _itemHeight <=
+               _contentLayout.padding.top + _contentLayout.spacing * _dataShowBeginIndex +
+               GetItemSequenceHeight(0, _dataShowBeginIndex) && _dataShowBeginIndex != 0)
+        {
+            //将数据列表中的最后一个元素移动到第一个
+            var item = _itemList.Last();
+            _itemList.Remove(item);
+            _itemList.Insert(0, item);
+            
+            _dataShowBeginIndex--;
+
+            //设置位置
+            SetItemPos(item, _dataShowBeginIndex);
+            //设置显示
+            SetItemData(item, _dataShowBeginIndex);
+        }
+
+        LiveDetailMessenger<bool, bool>.Broadcast(LiveDetailEvent.DanmakuOnScroll, IsInBottom(), IsFullScreen());
+    }
+    
+    /// <summary>
+    /// 自动回调刷新item数据
+    /// </summary>
+    /// <param name="trans"></param>
+    /// <param name="index"></param>
+    private void SetItemData(RectTransform trans, int index)
+    {
+        _setItemDataAction?.Invoke(trans, index);
+    }
+
+    /// <summary>
+    /// 清除所有item
+    /// </summary>
+    private void ClearAllItems()
+    {
+        for (int i = 0; i < _itemList.Count; i++)
+        {
+            var trans = _itemList[i];
+            Destroy(trans.gameObject);
+        }
+        _itemList.Clear();
+        _heightDataList.Clear();
+        _itemPosYList.Clear();
+        _dataShowBeginIndex = 0;
+        _lastVerticalNormalizePosition = 0;
+        
+        _itemHeight = _contentLayout.padding.top + _contentLayout.padding.bottom;
+        _content.sizeDelta = new Vector2(_content.sizeDelta.x, _itemHeight);
+    }
+
+    /// <summary>
+    /// 删除头部弹幕item
+    /// </summary>
+    public void RemoveTopItem()
+    {
+        if (_itemList.Count <= 1)
+        {
+            ClearAllItems();
+            return;
+        }
+        if (_heightDataList.Count <= itemTemplateNum)
+        {
+            var trans = _itemList[0];
+            _itemList.RemoveAt(0);
+            Destroy(trans.gameObject);
+        }
+        else if (_dataShowBeginIndex == 0)
+        {//头部item正在显示第一个数据
+            var item = _itemList[0];
+            _itemList.Remove(item);
+            _itemList.Add(item);
+            SetItemData(item, itemTemplateNum - 1);
+        }
+
+        float heightOffset = (_heightDataList[0] + _contentLayout.spacing);
+        _itemHeight -= heightOffset;
+        _content.sizeDelta = new Vector2(_content.sizeDelta.x, _itemHeight);
+
+        _heightDataList.RemoveAt(0);
+        _itemPosYList.RemoveAt(0);
+        if (_dataShowBeginIndex > 0)
+        {
+            _dataShowBeginIndex--;
+        }
+        
+        ReComputeAllItemPosY();
+        ResetAllItemPos();
+    }
+
+    /// <summary>
+    /// 调整content的高度
+    /// </summary>
+    /// <param name="offsetHeight">调整的数值</param>
+    private void AdjustContentSize(float offsetHeight)
+    {
+        _itemHeight += offsetHeight;
+        _content.sizeDelta = new Vector2(_content.sizeDelta.x, _itemHeight);
+        
+        var anchoredPosition = _content.anchoredPosition;
+        anchoredPosition = new Vector2(anchoredPosition.x, anchoredPosition.y - offsetHeight);
+        _content.anchoredPosition = anchoredPosition;
+    }
+    
+    /// <summary>
+    /// 重新设置所有item的位置
+    /// </summary>
+    private void ResetAllItemPos()
+    {
+        var hIndex = _dataShowBeginIndex;
+        for (int i = 0; i < _itemList.Count; i++)
+        {
+            SetItemPos(_itemList[i], hIndex++);
+        }
+    }
+    
+    /// <summary>
+    /// 设置单个item的位置
+    /// </summary>
+    /// <param name="trans">需要设置的item的rectTransform</param>
+    /// <param name="index">item的数据序号</param>
+    private void SetItemPos(RectTransform trans, int index)
+    {
+        float x = _content.rect.width / 2f;
+        trans.anchoredPosition = new Vector2(x, _itemPosYList[index]);
+    }
+
+    /// <summary>
+    /// 重新计算所有item的y坐标值，存到_itemPosYList中，并不实际应用到ui显示上。
+    /// 如果需要应用到显示，可以再调用RefreshAllItemPos()
+    /// </summary>
+    private void ReComputeAllItemPosY()
+    {
+        if (_itemPosYList.Count == 0)
+        {
+            return;
+        }
+
+        _itemPosYList[0] = -_contentLayout.padding.top - _heightDataList[0];
+        for (int i = 1; i < _itemPosYList.Count; i++)
+        {
+            var preY = _itemPosYList[i - 1];
+            _itemPosYList[i] = preY - _contentLayout.spacing - _heightDataList[i];
+        }
+    }
+    
+    /// <summary>
+    /// 展示新消息提示按钮
+    /// </summary>
+    private void ShowNewMessageTip()
+    {
+        LiveDetailMessenger.Broadcast(LiveDetailEvent.DanmakuNewMessageTipShow);
+    }
+    
+    [ContextMenu("ScrollToBottom")]
+    public void ScrollToBottom()
+    {
+        _scrollRect.DOVerticalNormalizedPos(0f, 0.5f);
+    }
+    
+    [ContextMenu("ScrollToTop")]
+    public void ScrollToTop()
+    {
+        _scrollRect.DOVerticalNormalizedPos(1f, 0.5f);
+    }
+    
+    public void ScrollDownHalfScreen()
+    {
+        float nowValue = _scrollRect.verticalNormalizedPosition;
+        if (nowValue <= 0f)
+        {
+            return;
+        }
+        float halfValue = _scrollRect.viewport.rect.height / 2.0f / _content.rect.height;
+        _scrollRect.DOVerticalNormalizedPos(nowValue - halfValue, 0.5f);
+    }
+
+    public void ScrollUpHalfScreen()
+    {
+        float nowValue = _scrollRect.verticalNormalizedPosition;
+        if (nowValue >= 1f)
+        {
+            return;
+        }
+        float halfValue = _scrollRect.viewport.rect.height / 2.0f / _content.rect.height;
+        _scrollRect.DOVerticalNormalizedPos(nowValue + halfValue, 0.5f);
+    }
+
+    public void ScrollOneLineScreen(bool isUp)
+    {
+        float nowValue = _scrollRect.verticalNormalizedPosition;
+        if (isUp && nowValue >= 1f)
+        {
+            return;
+        }
+        if (!isUp && nowValue <= 0f)
+        {
+            return;
+        }
+        float oneLineHeightOffset = _scrollRect.viewport.rect.height / 20f / _content.rect.height;//取viewport的1/20作为一行的高度
+        if (isUp)
+        {
+            _scrollRect.DOVerticalNormalizedPos(nowValue + oneLineHeightOffset, 0.1f);
+        }
+        else
+        {
+            _scrollRect.DOVerticalNormalizedPos(nowValue - oneLineHeightOffset, 0.1f);
+        }
+    }
+
+    private float GetItemSequenceHeight(int l,int r)
+    {
+        (l, r) = l > r ? (r, l) : (l, r);
+        l = l < 0 ? 0 : l;
+        r = r >= _heightDataList.Count ? _heightDataList.Count - 1 : r;
+
+        float result = 0f;
+        for (int i = l; i < r; i++)
+        {
+            result += _heightDataList[i];
+        }
+
+        return result;
+    }
+    
+    
+    public void OnEndDrag(PointerEventData eventData)
+    {
+        _isDragging = false;
+        LiveDetailUIManager.Instance.LiveDetailTrack?.tobsdk_livesdk_comment_review("past_comment", "roll");
+    }
+
+    public void OnBeginDrag(PointerEventData eventData)
+    {
+        _isDragging = true;
+    }
+    
+    public void OnPointerEnter(PointerEventData eventData)
+    {
+        var data = eventData as TrackedDeviceEventData;
+        if (data is { interactor: { } })
+        {
+            var interactorValue = data.interactor;
+            _hoverHand = (XRRayInteractor)interactorValue == XROriginInterface.Instance.LeftHandRay
+                ? XRNode.LeftHand
+                : XRNode.RightHand;
+        }
+        _isHover = true;
+    }
+    
+    public void OnPointerExit(PointerEventData eventData)
+    {
+        var data = eventData as TrackedDeviceEventData;
+        if (data is { interactor: { } })
+        {
+            var interactorValue = data.interactor;
+            _hoverHand = (XRRayInteractor)interactorValue == XROriginInterface.Instance.LeftHandRay
+                ? XRNode.LeftHand
+                : XRNode.RightHand;
+        }
+        _isHover = false;
+    }
+}
